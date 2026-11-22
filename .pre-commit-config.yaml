@@ -43,6 +43,7 @@ repos:
           - id: ruff-check
             types_or: [python, pyi]
             args: [--fix]
-          # Run the formatter except on Jupyter Notebooks.
+          # Run the formatter except on Jupyter Notebooks. Markdown is included because
+          # CI's `ruff format --check` also formats Python code blocks in .md files.
           - id: ruff-format
-            types_or: [python, pyi]
+            types_or: [python, pyi, markdown]

@@ -225,11 +225,11 @@ solver = make_torch_sci_solver(device="mps", dtype=torch.float32)
 solver = make_torch_sci_solver(
     distributed={
         "world_size": 2,
-        "backend": "nccl",   # "nccl" for CUDA ranks, "gloo" for CPU ranks
+        "backend": "nccl",  # "nccl" for CUDA ranks, "gloo" for CPU ranks
         "device_ids": [0, 1],
         "persistent": True,  # default: ranks stay up across solver calls
-        "matvec": "local",   # owner-computes; "replicated" is the fallback
-        "tile": "auto",      # 2-D tile grid: "auto" | "force" | [p_a, p_b]
+        "matvec": "local",  # owner-computes; "replicated" is the fallback
+        "tile": "auto",  # 2-D tile grid: "auto" | "force" | [p_a, p_b]
         # "checkpoint_dir": "/path/to/ckpt",  # periodic Davidson checkpoint/restart
         # "checkpoint_every": 50,             # Davidson iterations between writes
         # "checkpoint_resume": "auto",        # "auto" | "off" | "require"
