@@ -1,0 +1,17 @@
+# SciPy LOBPCG
+# on CPU, with fulqrum assembling the Hamiltonian as a CSR matrix
+# (needs `--extra fulqrum`).
+# Solver settings as in ../solvers/lobpcg_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: lobpcg_fulqrum_csr_cpu_spin_sq_null
+    name: lobpcg
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      hamiltonian_backend: fulqrum
+      fulqrum_mode: csr
+      symmetrize_spin: true
+      tol: 1.0e-4
+      maxiter: 80
+    call_kwargs: {}

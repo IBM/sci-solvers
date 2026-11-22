@@ -1,0 +1,15 @@
+# SciPy ARPACK
+# on CPU with the batched matrix-vector product.
+# Solver settings as in ../solvers/arpack_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: arpack_cpu_spin_sq_null
+    name: arpack
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      symmetrize_spin: true
+      use_operator: true
+      ncv: 21
+      tol: 4.0e-7
+    call_kwargs: {}

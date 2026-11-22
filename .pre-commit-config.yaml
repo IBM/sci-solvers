@@ -1,0 +1,48 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+    - repo: local
+      hooks:
+          - id: block-triton-kernel-edits
+            name: Block edits to Triton kernel files (require manual tests)
+            entry: >-
+                bash -c 'echo "ERROR: this file contains hand-written Triton
+                kernel code. Make sure you ran all tests with GPU access and Triton
+                installed. Only when confident, commit manually with --no-verify." >&2; exit 1'
+            language: system
+            pass_filenames: false
+            files: ^packages/torch-sci-solver/torch_sci_solver/torch_impl/mult_triton\.py$
+          - id: license-headers
+            name: Check license header is present
+            entry: uv run python scripts/check_license_headers.py
+            language: system
+            # Header-requiring source only: Python, shell, and Dockerfiles.
+            # Data/fixtures, lock files, ignore lists, and YAML are intentionally
+            # excluded -- extend types_or/files here if the policy changes.
+            types_or: [python, shell, dockerfile]
+            # `.dockerignore` is typed as a dockerfile by identify but is an
+            # ignore-pattern list, not source -- skip it.
+            exclude: \.dockerignore$
+            require_serial: true
+    - repo: https://github.com/pre-commit/pre-commit-hooks
+      rev: v6.0.0
+      hooks:
+          - id: trailing-whitespace
+            args: [--markdown-linebreak-ext=md]
+          - id: end-of-file-fixer
+          - id: check-yaml
+          - id: check-added-large-files
+            args: ["--maxkb=2000"]
+            # Shipped sample data (9 MB).
+            exclude: ^packages/torch-sci-solver/torch_sci_solver/data/benzoic_acid_182\.fcidump$
+    - repo: https://github.com/astral-sh/ruff-pre-commit
+      # Ruff version.
+      rev: v0.17.3
+      hooks:
+          # Run the linter.
+          - id: ruff-check
+            types_or: [python, pyi]
+            args: [--fix]
+          # Run the formatter except on Jupyter Notebooks.
+          - id: ruff-format
+            types_or: [python, pyi]

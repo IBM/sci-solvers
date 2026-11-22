@@ -1,0 +1,24 @@
+# Default GDB sanity suite: the built-in PySCF cases, so it needs no data files. To check a
+# real system, add a case that points to its FCIDUMP file (see gdb_cases.py for the schema;
+# relative paths resolve against this file).
+#
+#   uv run python src/sanity_checks/gdb_sanity_check.py src/sanity_checks/suites/default.yaml
+
+defaults:
+  # torch arpack, davidson, lobpcg, then each solver in all three fulqrum modes
+  # (@fulqrum is csr); each non-csr mode is also checked against csr. The fulqrum rows
+  # SKIP without the fulqrum extra.
+  solvers:
+    [
+      arpack, davidson, lobpcg,
+      arpack@fulqrum, arpack@fulqrum:csr_fast, arpack@fulqrum:matrix_free,
+      lobpcg@fulqrum, lobpcg@fulqrum:csr_fast, lobpcg@fulqrum:matrix_free,
+      davidson@fulqrum, davidson@fulqrum:csr_fast, davidson@fulqrum:matrix_free
+    ]
+
+datasets:
+  - {name: n2, hamiltonian: {builtin: real_molecule}}
+  - {name: nh2_rotated, hamiltonian: {builtin: rotated_radical}}
+  - {name: h4_twisted_22, hamiltonian: {builtin: twisted_hydrogen_chain, nelec: [2, 2]}}
+  - {name: h4_twisted_21, hamiltonian: {builtin: twisted_hydrogen_chain, nelec: [2, 1]}}
+  - {name: h4_twisted_31, hamiltonian: {builtin: twisted_hydrogen_chain, nelec: [3, 1]}}

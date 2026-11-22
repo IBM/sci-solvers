@@ -1,0 +1,7 @@
+# PySCF's Davidson on the general-algebra operator.
+common_file: ../_common.yaml
+solver_variants:
+  - id: pyscf_davidson_cpu_spin_sq_null
+    name: pyscf_davidson
+    init_kwargs: {symmetrize_spin: true, tol: 1.0e-8, maxiter: 80, davidson_block_size: 10}
+    call_kwargs: {}

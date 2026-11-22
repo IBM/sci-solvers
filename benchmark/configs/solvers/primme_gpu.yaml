@@ -1,0 +1,9 @@
+# PRIMME (needs `--extra primme`) with the matrix-vector product on the GPU (Triton kernel).
+# tol is an absolute residual bound (the solver's default a_norm = 1).
+common_file: ../_common.yaml
+solver_variants:
+  - id: primme_gpu_spin_sq_null
+    name: primme
+    init_kwargs: {device: cuda, matvec_impl: triton, symmetrize_spin: true, tol: 1.0e-4,
+                  max_restarts: 5000}
+    call_kwargs: {}

@@ -1,0 +1,8 @@
+# torch-sci on one GPU with a singlet penalty (spin_sq = 0); otherwise as torch_sci_gpu.
+common_file: ../_common.yaml
+solver_variants:
+  - id: torch_sci_gpu_spin_sq_0
+    name: torch_sci
+    init_kwargs: {device: cuda, symmetrize_spin: true, davidson_block_size: 10,
+                  max_davidson_iters: 8, davidson_tolerance: 1.0e-4, apply_ab_projection: false}
+    call_kwargs: {spin_sq: 0.0}

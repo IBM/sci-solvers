@@ -1,0 +1,18 @@
+# SciPy ARPACK
+# on CPU, with fulqrum's faster two-stage CSR assembly, which needs
+# about twice the memory (needs `--extra fulqrum`).
+# Solver settings as in ../solvers/arpack_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: arpack_fulqrum_fast_cpu_spin_sq_null
+    name: arpack
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      hamiltonian_backend: fulqrum
+      fulqrum_mode: csr_fast
+      symmetrize_spin: true
+      use_operator: true
+      ncv: 21
+      tol: 4.0e-7
+    call_kwargs: {}

@@ -1,0 +1,38 @@
+name: CI
+
+# scripts/local_ci.sh runs these same steps locally; keep the two in sync.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: License headers
+        run: python3 scripts/check_license_headers.py $(git ls-files '*.py' '*.sh')
+      - name: Ruff
+        run: uvx ruff@0.17.3 check
+      - name: Ruff format
+        run: uvx ruff@0.17.3 format --check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --extra cpu --extra benchmark
+      - name: mypy
+        run: uv run --extra cpu --extra benchmark mypy
+      - name: Tests
+        run: uv run --extra cpu --extra benchmark pytest -m "not slow" -n auto

@@ -1,0 +1,18 @@
+# Settings shared by every solver config (merged in via `common_file: ../_common.yaml`;
+# keys in a solver config win). base_dir is passed on the command line (--base_dir).
+
+# "auto" runs every molecule under <base_dir>/molecules/ and every input family found
+# there (sqdrift, lucj, hf_expansion); a list restricts them.
+molecules: auto
+circuit_types: auto
+
+common:
+  subsample_size: 0       # bitstrings drawn per cell; 0 = all (run_ladder.sh sets it per size)
+  symmetrize_spin: true   # alpha and beta use the union of both halves
+  inject_hf: true         # the Hartree-Fock bitstring is always in the subspace
+  num_runs: 3             # timed calls per cell
+  seed: 42
+  warmup: true            # one untimed call first
+  measure_memory: true    # peak host RAM and GPU memory per timed call
+  nroots: 1               # ground state only
+  run_timeout: 21600      # 6 h cap on each solver call

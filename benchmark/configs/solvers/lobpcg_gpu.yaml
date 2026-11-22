@@ -1,0 +1,8 @@
+# SciPy LOBPCG with the matrix-vector product on the GPU (Triton kernel).
+common_file: ../_common.yaml
+solver_variants:
+  - id: lobpcg_gpu_spin_sq_null
+    name: lobpcg
+    init_kwargs: {device: cuda, matvec_impl: triton, symmetrize_spin: true, tol: 1.0e-4,
+                  maxiter: 80}
+    call_kwargs: {}

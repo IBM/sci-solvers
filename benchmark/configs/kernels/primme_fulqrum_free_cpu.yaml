@@ -1,0 +1,17 @@
+# PRIMME (needs `--extra primme`)
+# on CPU, with fulqrum's matrix-free product, which regenerates the
+# matrix elements on every product (needs `--extra fulqrum`).
+# Solver settings as in ../solvers/primme_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: primme_fulqrum_free_cpu_spin_sq_null
+    name: primme
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      hamiltonian_backend: fulqrum
+      fulqrum_mode: matrix_free
+      symmetrize_spin: true
+      tol: 1.0e-4
+      max_restarts: 5000
+    call_kwargs: {}

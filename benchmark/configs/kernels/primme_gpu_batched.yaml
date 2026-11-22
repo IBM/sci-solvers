@@ -1,0 +1,15 @@
+# PRIMME (needs `--extra primme`)
+# on the GPU with the portable batched matrix-vector product, the
+# baseline for the Triton kernel in ../solvers/.
+# Solver settings as in ../solvers/primme_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: primme_gpu_batched_spin_sq_null
+    name: primme
+    init_kwargs:
+      device: cuda
+      matvec_impl: batched
+      symmetrize_spin: true
+      tol: 1.0e-4
+      max_restarts: 5000
+    call_kwargs: {}

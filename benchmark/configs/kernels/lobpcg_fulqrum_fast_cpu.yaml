@@ -1,0 +1,17 @@
+# SciPy LOBPCG
+# on CPU, with fulqrum's faster two-stage CSR assembly, which needs
+# about twice the memory (needs `--extra fulqrum`).
+# Solver settings as in ../solvers/lobpcg_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: lobpcg_fulqrum_fast_cpu_spin_sq_null
+    name: lobpcg
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      hamiltonian_backend: fulqrum
+      fulqrum_mode: csr_fast
+      symmetrize_spin: true
+      tol: 1.0e-4
+      maxiter: 80
+    call_kwargs: {}

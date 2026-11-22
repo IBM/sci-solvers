@@ -1,0 +1,8 @@
+# sbd's Davidson on CPU (needs `--extra sbd`); otherwise as sbd_gpu.
+common_file: ../_common.yaml
+solver_variants:
+  - id: sbd_cpu_spin_sq_null
+    name: sbd
+    init_kwargs: {device: cpu, symmetrize_spin: true,
+                  sbd_config: {eps: 1.0e-4, max_nb: 10, max_it: 8, max_time: 36000}}
+    call_kwargs: {spin_sq: null}

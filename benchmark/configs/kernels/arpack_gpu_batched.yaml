@@ -1,0 +1,16 @@
+# SciPy ARPACK
+# on the GPU with the portable batched matrix-vector product, the
+# baseline for the Triton kernel in ../solvers/.
+# Solver settings as in ../solvers/arpack_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: arpack_gpu_batched_spin_sq_null
+    name: arpack
+    init_kwargs:
+      device: cuda
+      matvec_impl: batched
+      symmetrize_spin: true
+      use_operator: true
+      ncv: 21
+      tol: 4.0e-7
+    call_kwargs: {}

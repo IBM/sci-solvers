@@ -1,0 +1,7 @@
+# PySCF selected CI with a singlet penalty (spin_sq = 0); otherwise as pyscf_cpu.
+common_file: ../_common.yaml
+solver_variants:
+  - id: pyscf_cpu_spin_sq_0
+    name: pyscf
+    init_kwargs: {symmetrize_spin: true}
+    call_kwargs: {spin_sq: 0.0, tol: 1.0e-8, max_cycle: 80, davidson_block_size: 10}

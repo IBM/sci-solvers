@@ -1,0 +1,8 @@
+# PySCF selected CI, unpenalized. tol = 1e-8 on |dE| is PySCF's counterpart of a 1e-4
+# residual tolerance (it also requires the residual norm below sqrt(tol)).
+common_file: ../_common.yaml
+solver_variants:
+  - id: pyscf_cpu_spin_sq_null
+    name: pyscf
+    init_kwargs: {symmetrize_spin: true}
+    call_kwargs: {spin_sq: null, tol: 1.0e-8, max_cycle: 80, davidson_block_size: 10}

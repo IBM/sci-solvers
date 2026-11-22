@@ -1,0 +1,371 @@
+[project]
+name = "sci_solvers"
+version = "0.1.0"
+description = "Selected configuration interaction (SCI) eigensolvers behind one interface: wrappers for external diagonalizers, native GPU solvers, and build recipes."
+authors = [{ name = "IBM Research" }]
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+license = "Apache-2.0"
+dependencies = [
+    "numpy>=2.3.0",
+    "scipy>=1.15.0",
+    "loguru>=0.7.3",
+    "pyyaml",
+    "jsonargparse",
+    "numba>=0.66.0",
+    "pyscf>=2.5",
+    "psutil",
+    "qiskit-addon-dice-solver",
+    "qiskit-addon-sqd>=0.10",
+    "torch-sci-solver",
+    "tqdm>=4.70.0",
+]
+
+[project.optional-dependencies]
+# External diagonalizers usable via MultirootSCISolver's SLEPc/PRIMME adapters.
+# Split so each backend installs independently; `external-solvers` pulls both.
+# Opt in with e.g. `uv sync --extra external-solvers` (or --extra primme).
+#
+# primme: PRIMME preconditioned Davidson/JDQMR bindings.
+primme = ["primme"]
+# slepc: SLEPc EPS via slepc4py. slepc4py links against the SLEPc/PETSc runtime
+# libraries, which ship in the `slepc`/`petsc` binary packages (parallel to the
+# bindings) — slepc4py's rpath resolves libslepc/libpetsc from those package
+# dirs, so they must be present.
+# NOTE: the `petsc` wheel here is REAL-scalar. PETSc fixes its scalar type at
+# build time, so the `slepc` adapter cannot diagonalize a *complex* Hermitian
+# operator with this build (it raises NotImplementedError, and the complex
+# slepc tests skip). Complex work needs a complex-scalar PETSc build; use
+# arpack/lobpcg/davidson/primme otherwise.
+slepc = ["slepc4py", "slepc", "petsc"]
+external-solvers = ["sci_solvers[primme,slepc]"]
+# sbd: RIKEN's in-process SBD eigensolver (`import sbd`), backing the `"sbd"`
+# solver (TPB + GDB modes). It has NO PyPI wheel — the PyPI sdist (which carries
+# the vendored SBD sources) compiles a pybind11 extension against local MPI/BLAS
+# (and the NVIDIA HPC SDK for the GPU/Thrust backend) at install time, so it is kept
+# OUT of the base dependencies: a plain `uv sync` never tries to build it and
+# cannot break. Prepare the native prerequisites with
+# `scripts/energy_solvers/build_sbd.sh` — it auto-detects the nvc++ GPU
+# toolchain and prepares a GPU-capable build for one GPU architecture when
+# nvc++ is present (else CPU) — then opt in
+# with `uv sync --extra sbd`. See that script.
+# >= 1.7.1: from 1.7.1 the package returns the TPB state in PySCF's sign
+# convention (sbd-eigensolver-python #62, backported in #63), which `SBDSolver`
+# relies on; 1.7.0 and earlier releases return SBD's own convention.
+sbd = ["sbd-eigensolver>=1.7.1"]
+# sbd-gpu: `sbd` plus a torch built on a CUDA 12 runtime (PyTorch cu128 index). The sbd GPU
+# backend links CUDA 12 (NVHPC 24.5); with a CUDA-13 torch loaded first it silently returns
+# Energy = 0 (see docs/solvers/sbd.md). Use `uv sync --extra sbd-gpu` on GPU
+# nodes; without it torch comes from PyPI (CUDA 13 today) and `SBDSolver` warns at construction.
+sbd-gpu = ["sci_solvers[sbd]", "torch"]
+# cpu: slim CPU-only torch wheel (PyTorch cpu index). Exists mainly so uv can fork the lock
+# between it and `sbd-gpu`; without a declared conflict uv resolves one torch for every install.
+cpu = ["torch"]
+# fulqrum: IBM's subspace-Hamiltonian builder (`import fulqrum`), backing
+# `hamiltonian_backend="fulqrum"` on the general-algebra solvers. PyPI ships an
+# sdist only, so installing compiles its C++/Cython extension (OpenMP) locally;
+# on Linux the system GCC suffices, while macOS sets
+# CXX=scripts/energy_solvers/clang_omp.sh (Apple clang, linked to torch's libomp; the
+# `fulqrum`/`all` pixi envs set it themselves). Built without isolation (see [tool.uv]) so
+# torch is installed first. Kept out of the base dependencies so a plain `uv sync` never
+# builds it; opt in with `uv sync --extra fulqrum`. The `<0.5` pin guards against API
+# changes in fulqrum's unreleased 0.5.
+fulqrum = ["fulqrum>=0.4.5,<0.5"]
+# benchmark: the cross-solver benchmark scripts under `benchmark/` (a workspace member).
+# Not needed to run any solver.
+benchmark = ["sci-solvers-benchmark"]
+# evsl: the EVSL spectrum-slicing adapter has NO PyPI package — EVSL is a native
+# C library built from source by `scripts/energy_solvers/build_evsl.sh`. There is
+# nothing to `pip install`; point the loader at the built `libevsl` via the
+# `SCI_SOLVERS_EVSL_LIB` env var (or place it on the system loader path). Listed
+# here only to document the adapter's dependency; the extra installs nothing.
+evsl = []
+
+[build-system]
+requires = ["setuptools>=77", "wheel", "pybind11>=2.12"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages]
+find = { where = ["src"], include = ["sci_solvers*"] }
+
+[tool.setuptools.package-data]
+"sci_solvers" = ["py.typed"]
+# Ship the compiled C++ kernel extension in built wheels (opt-in `cpp` backend).
+"sci_solvers.energy_solvers.truncated_davidson_solver.cpp" = ["*.so", "*.pyd"]
+
+[tool.uv]
+# fulqrum (macOS) compiles against torch's omp.h and libomp, so it must build in the target
+# venv after torch is installed; uv installs non-isolated packages last. Its build
+# requirements (numpy, cython, setuptools) are already runtime dependencies in the venv.
+no-build-isolation-package = ["fulqrum"]
+conflicts = [[{ extra = "cpu" }, { extra = "sbd-gpu" }]]
+# the following constraints do not force installation but help to avoid vulnerabilities
+constraint-dependencies = [
+    "accelerate>=1.12.0",
+    "aiohttp>=3.14.1",
+    "certifi>=2026.10.18",
+    "cryptography>=46.0.7",
+    "click>=8.3.3",
+    "fonttools>=4.60.2",
+    "filelock>=4.2.1",
+    "idna>=3.15",
+    "pillow>=12.1.1",
+    "plotly>=6.6.0",
+    "pot>=0.9.6.post1",
+    "pygments>=2.20.0",
+    "pyjwt>=2.13.0",
+    "python-levenshtein>=0.25.0", # This is a shim only depending on levenshtein
+    "requests>=2.33.0",
+    "urllib3>=2.7.0",
+    "virtualenv>=21.14.10",
+    "qiskit!=2.6.0",
+]
+[[tool.uv.index]]
+name = "PyPI"
+url = "https://pypi.org/simple/"
+priority = "primary"
+
+# PyTorch CUDA 12.8 wheels. `explicit = true`: only packages that name this index in
+# [tool.uv.sources] use it; here that is torch under the `sbd-gpu` extra only, so default
+# installs are unaffected. Keeps torch on a CUDA 12 runtime for sbd_gpu.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# petsc4py/slepc4py ship only as sdists whose setup.py reports their dependencies only once
+# PETSc is installed, so locking them on a fresh cache compiles PETSc. State them instead, as
+# locked; bump them with PETSc.
+[[tool.uv.dependency-metadata]]
+name = "petsc4py"
+version = "3.26.0"
+requires-dist = ["numpy>=1.19", "petsc>=3.26,<3.27"]
+
+[[tool.uv.dependency-metadata]]
+name = "slepc4py"
+version = "3.26.0"
+requires-dist = ["numpy>=1.19", "petsc4py>=3.26,<3.27"]
+
+[tool.uv.sources]
+# Upstream main, pinned to an exact commit: DICESolver needs multi-root support (upstream
+# #111), which no release contains yet (latest is 0.3.0), and
+# sci_solvers.energy_solvers._dice_compat patches two private upstream functions.
+qiskit-addon-dice-solver = { git = "https://github.com/Qiskit/qiskit-addon-dice-solver", rev = "58c45f4106396914ce496c09e21dcb2be073dc34" }
+torch-sci-solver = { workspace = true }
+sci-solvers-benchmark = { workspace = true }
+# The benchmark member depends on this root package, which uv resolves from the workspace.
+sci_solvers = { workspace = true }
+torch = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { index = "pytorch-cu128", extra = "sbd-gpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+
+[tool.uv.workspace]
+members = ["packages/*", "benchmark"]
+
+[dependency-groups]
+dev = [
+    "ipdb",
+    "jupyter>=1.0.0",
+    "mypy>=1.0.0",
+    "pre-commit>=4.0.1",
+    "pytest>=9.0.3",
+    "pytest-cov>=2.8.1",
+    "pytest-xdist>=3.8.0",
+    "ruff==0.17.3",
+    "types-setuptools>=57.4.14",
+]
+
+[tool.mypy]
+check_untyped_defs = true
+# Library code only; src/examples and src/sanity_checks are scripts.
+files = ["src/sci_solvers"]
+
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "torch_sci_solver.*",
+    "yaml.*",
+    "scipy.*",
+    "petsc4py.*",
+    "slepc4py.*",
+    "primme.*",
+    "pybind11.*",
+    "sbd.*",
+    "fulqrum.*",
+    "pyscf.*",
+    "h5py.*",
+    "qiskit_addon_dice_solver.*",
+    "qiskit_addon_sqd.*",
+]
+ignore_missing_imports = true
+
+# The compiled C++ kernel extension (built by setup.py) has no type stubs and is
+# imported dynamically; mypy can't see the attributes of the .so module.
+[[tool.mypy.overrides]]
+module = ["sci_solvers.energy_solvers.truncated_davidson_solver.cpp.*"]
+ignore_missing_imports = true
+
+# Modules with known type errors, skipped so mypy can gate CI. Fix a module, then drop it
+# from this list.
+[[tool.mypy.overrides]]
+module = [
+    "sci_solvers.complex_ci_problem",
+    "sci_solvers.energy_solvers.davidson_solver",
+    "sci_solvers.energy_solvers.general_algebra_base",
+]
+ignore_errors = true
+
+[tool.ruff]
+# Include also Jupyter notebooks.
+extend-include = ["*.ipynb"]
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+
+# Same as Black.
+line-length = 100
+indent-width = 4
+
+target-version = "py310"
+
+[tool.ruff.lint]
+ignore = ["F722", "N806", "N803", "N802", "ARG005", "PTH207"]
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
+# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
+# McCabe complexity (`C901`) by default.
+preview = true
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "W291",
+    "W292",
+    "W505",
+    "E721",
+    "I",
+    "N801",
+    "N804",
+    "N805",
+    "N816",
+    "D101",
+    "D102",
+    "D103",
+    "D105",
+    "D106",
+    "D107",
+    "D300",
+    "UP010",
+    "UP011",
+    "UP019",
+    "UP032",
+    "ARG",
+    "PTH",
+    "LOG001",
+    "LOG002",
+]
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.format]
+preview = true
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+# This only has an effect when the `docstring-code-format` setting is
+# enabled.
+docstring-code-line-length = "dynamic"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: requires a GPU; includes correctness and runtime comparisons",
+]
+testpaths = ["tests", "packages/torch-sci-solver/tests", "benchmark/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+
+# pixi (optional alternative to uv): `pixi install -e all`. Extras and dependency groups
+# become pixi features of the same name.
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = [
+    { name = "linux-64-cuda-13", platform = "linux-64", cuda = "13" },
+    "linux-64",
+    "osx-arm64",
+]
+
+# pixi installs PyPI packages into a conda python, so it needs one; requires-python, capped
+# below the first version torch has no wheels for.
+[tool.pixi.dependencies]
+python = ">=3.12,<3.15"
+
+# pixi reads this manifest itself and ignores [tool.uv.sources], so repeat those sources.
+[tool.pixi.pypi-dependencies]
+sci_solvers = { path = ".", editable = true }
+torch-sci-solver = { path = "packages/torch-sci-solver", editable = true }
+sci-solvers-benchmark = { path = "benchmark", editable = true }
+qiskit-addon-dice-solver = { git = "https://github.com/Qiskit/qiskit-addon-dice-solver", rev = "58c45f4106396914ce496c09e21dcb2be073dc34" }
+
+# Like [tool.uv] no-build-isolation-package: fulqrum builds in the env, after torch.
+[tool.pixi.pypi-options]
+no-build-isolation = ["fulqrum"]
+
+# macOS: build fulqrum with Apple clang against torch's OpenMP runtime (see clang_omp.sh).
+[tool.pixi.feature.fulqrum.target.osx-arm64.activation.env]
+CXX = "$PIXI_PROJECT_ROOT/scripts/energy_solvers/clang_omp.sh"
+
+[tool.pixi.environments]
+fulqrum = { features = ["fulqrum"], solve-group = "default" }
+all = { features = ["fulqrum", "benchmark", "dev"], solve-group = "default" }

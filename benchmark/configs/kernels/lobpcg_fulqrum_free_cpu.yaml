@@ -1,0 +1,17 @@
+# SciPy LOBPCG
+# on CPU, with fulqrum's matrix-free product, which regenerates the
+# matrix elements on every product (needs `--extra fulqrum`).
+# Solver settings as in ../solvers/lobpcg_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: lobpcg_fulqrum_free_cpu_spin_sq_null
+    name: lobpcg
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      hamiltonian_backend: fulqrum
+      fulqrum_mode: matrix_free
+      symmetrize_spin: true
+      tol: 1.0e-4
+      maxiter: 80
+    call_kwargs: {}

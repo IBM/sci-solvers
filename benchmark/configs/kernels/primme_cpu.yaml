@@ -1,0 +1,14 @@
+# PRIMME (needs `--extra primme`)
+# on CPU with the batched matrix-vector product.
+# Solver settings as in ../solvers/primme_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: primme_cpu_spin_sq_null
+    name: primme
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      symmetrize_spin: true
+      tol: 1.0e-4
+      max_restarts: 5000
+    call_kwargs: {}

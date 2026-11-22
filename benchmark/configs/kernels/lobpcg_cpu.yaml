@@ -1,0 +1,14 @@
+# SciPy LOBPCG
+# on CPU with the batched matrix-vector product.
+# Solver settings as in ../solvers/lobpcg_gpu.yaml.
+common_file: ../_common.yaml
+solver_variants:
+  - id: lobpcg_cpu_spin_sq_null
+    name: lobpcg
+    init_kwargs:
+      device: cpu
+      matvec_impl: batched
+      symmetrize_spin: true
+      tol: 1.0e-4
+      maxiter: 80
+    call_kwargs: {}

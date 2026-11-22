@@ -1,0 +1,9 @@
+# torch-sci on one GPU, unpenalized. Davidson settings shared with pyscf and sbd:
+# residual tolerance 1e-4, subspace 10, 8 restarts (at most 80 matrix-vector products).
+common_file: ../_common.yaml
+solver_variants:
+  - id: torch_sci_gpu_spin_sq_null
+    name: torch_sci
+    init_kwargs: {device: cuda, symmetrize_spin: true, davidson_block_size: 10,
+                  max_davidson_iters: 8, davidson_tolerance: 1.0e-4, apply_ab_projection: false}
+    call_kwargs: {spin_sq: null}

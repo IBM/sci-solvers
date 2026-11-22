@@ -1,0 +1,16 @@
+sci-solvers
+Copyright 2026 IBM Corp.
+
+This product includes software derived from SBD
+(https://github.com/r-ccs-cms/sbd), licensed under the Apache License,
+Version 2.0:
+
+  Copyright 2025 RIKEN and its contributors.
+  Copyright 2026 Advanced Micro Devices, Inc.
+  Copyright 2026 International Business Machines, Inc.
+
+The Python code in packages/torch-sci-solver/torch_sci_solver/sbd_ref/ is a
+modified port of SBD's C++ selected-basis diagonalization code, and the
+modules in packages/torch-sci-solver/torch_sci_solver/torch_impl/ that build
+on it (davidson, determinants, mult, helpers) are derived from it.
+Each of those files carries a notice to that effect.

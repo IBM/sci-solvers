@@ -1,0 +1,8 @@
+# SciPy ARPACK with the matrix-vector product on the GPU (Triton kernel).
+common_file: ../_common.yaml
+solver_variants:
+  - id: arpack_gpu_spin_sq_null
+    name: arpack
+    init_kwargs: {device: cuda, matvec_impl: triton, symmetrize_spin: true, use_operator: true,
+                  ncv: 21, tol: 4.0e-7}
+    call_kwargs: {}

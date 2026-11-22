@@ -1,0 +1,9 @@
+# Dice (needs the external Dice binary, see scripts/energy_solvers/). Dice only solves with
+# spin_sq = 0; run_single recomputes its energy from the RDMs (see run_single._dice_energy).
+common_file: ../_common.yaml
+solver_variants:
+  - id: dice_cpu_spin_sq_0
+    name: dice
+    init_kwargs: {symmetrize_spin: true,
+                  mpirun_options: "-n 16 -x OMP_NUM_THREADS=1 -x MKL_NUM_THREADS=1 -x OPENBLAS_NUM_THREADS=1"}
+    call_kwargs: {spin_sq: 0.0}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sci-solvers-benchmark"
+version = "0.1.0"
+description = "Cross-solver timing, memory and accuracy benchmark for the sci-solvers eigensolvers"
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+license = "Apache-2.0"
+authors = [{ name = "IBM Research" }]
+dependencies = [
+    "sci_solvers",
+    "numpy>=2.3.0",
+    "pyyaml",
+    "jsonargparse",
+    "psutil",
+    "nvidia-ml-py>=12.0",
+    "qiskit-addon-sqd>=0.10",
+]
+
+[project.scripts]
+sci-bench-prepare-quantum = "sci_solvers_benchmark.prepare_quantum:main"
+sci-bench-prepare-synthetic = "sci_solvers_benchmark.prepare_synthetic:main"
+
+[tool.setuptools.packages.find]
+include = ["sci_solvers_benchmark*"]
