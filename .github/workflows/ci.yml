@@ -25,6 +25,17 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # A hung distributed test would otherwise block the job for GitHub's 6 h default.
+    timeout-minutes: 90
+    env:
+      # Pin the interpreter to the tested one; uv otherwise picks the newest release.
+      UV_PYTHON: "3.13"
+      # One thread per process, as in scripts/local_ci.sh: several tests spawn multi-rank
+      # gloo groups, and a default thread pool per rank oversubscribes the runner's cores.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMBA_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -35,4 +46,4 @@ jobs:
       - name: mypy
         run: uv run --extra cpu --extra benchmark mypy
       - name: Tests
-        run: uv run --extra cpu --extra benchmark pytest -m "not slow" -n auto
+        run: uv run --extra cpu --extra benchmark pytest -m "not slow" -n auto -v --durations=15

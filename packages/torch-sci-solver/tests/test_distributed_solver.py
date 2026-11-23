@@ -836,6 +836,7 @@ def test_distributed_tiny_block_size_still_converges() -> None:
     assert observed == pytest.approx(expected, abs=1e-8)
 
 
+@pytest.mark.slow
 def test_large_result_round_trip() -> None:
     """A result larger than a 64 KiB pipe buffer comes back intact.
 

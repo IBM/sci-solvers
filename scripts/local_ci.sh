@@ -36,6 +36,8 @@ done
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 cd "$REPO_ROOT"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+# CI pins the interpreter too (uv would otherwise pick the newest release).
+export UV_PYTHON="${UV_PYTHON:-3.13}"
 
 if [ "$gpu" = 1 ]; then
     if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
@@ -56,7 +58,7 @@ if [ "$gpu" = 1 ]; then
 else
     export UV_PROJECT_ENVIRONMENT="$REPO_ROOT/build/local_ci_venv"
     extras=(--extra cpu --extra benchmark)
-    tests=(pytest -m "not slow" -n "$workers")
+    tests=(pytest -m "not slow" -n "$workers" -v --durations=15)
 fi
 
 failed=()
