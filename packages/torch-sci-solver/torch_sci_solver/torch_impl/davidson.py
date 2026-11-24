@@ -116,7 +116,9 @@ def basis_init_vector_torch(
               given device).
         seed_index: flat basis index receiving the unit seed when ``init=0``
               (default 0, the smallest-int determinant of a sorted basis).
-              The adapter passes the argmin of the diagonal.
+              The solver passes the lowest diagonal entry for a single-root
+              cold start (``seed_strategy`` other than ``"connected"``), and
+              each disconnected block's lowest entry for that block's solve.
 
     Raises:
         ValueError: ``init`` is neither 0 nor 1, or ``seed_index`` is out of
