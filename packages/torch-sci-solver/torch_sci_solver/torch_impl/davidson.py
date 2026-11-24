@@ -100,6 +100,7 @@ def basis_init_vector_torch(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float64,
     seed: Optional[int] = None,
+    seed_index: int = 0,
 ) -> Tensor:
     """Initial wavefunction over the (n_alpha × n_beta) Cartesian basis.
 
@@ -107,19 +108,28 @@ def basis_init_vector_torch(
 
     Args:
         n_alpha, n_beta: basis sizes.
-        init: 0 = HF (unit vector at index 0, plus a tiny fixed-seed
+        init: 0 = HF (unit vector at ``seed_index``, plus a tiny fixed-seed
               perturbation — see below), 1 = random uniform.
         device: torch device.
         dtype: float dtype.
         seed: optional seed for init=1 (uses torch.Generator on the
               given device).
+        seed_index: flat basis index receiving the unit seed when ``init=0``
+              (default 0, the smallest-int determinant of a sorted basis).
+              The adapter passes the argmin of the diagonal.
+
+    Raises:
+        ValueError: ``init`` is neither 0 nor 1, or ``seed_index`` is out of
+            range.
     """
     if isinstance(device, str):
         device = torch.device(device)
     N = n_alpha * n_beta
     W = torch.zeros(N, dtype=dtype, device=device)
     if init == 0:
-        W[0] = 1.0
+        if not 0 <= seed_index < N:
+            raise ValueError(f"seed_index must be in [0, {N}), got {seed_index}")
+        W[seed_index] = 1.0
         # A pure one-hot HF guess can already be an exact eigenvector of the
         # local Hamiltonian block. The residual is then exactly 0 at the
         # Davidson step, so the loop thinks wrongly convergence is reached.
