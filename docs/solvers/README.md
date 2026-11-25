@@ -48,6 +48,18 @@ verbatim to the chosen solver's `__init__`
 `is_general_algebra` — so a launcher can filter solvers by feature before it commits
 to one.
 
+Another installed package can add a solver without editing the factory, by declaring an entry
+point in the `sci_solvers.solvers` group:
+
+```toml
+[project.entry-points."sci_solvers.solvers"]
+my_solver = "my_package.my_solver:MySolver"
+```
+
+Once that package is installed, `my_solver` appears in `AVAILABLE_SOLVERS` and works with
+`create_solver` and the capability queries. As for the built-in solvers, the class is imported
+only when it is used, and a plugin cannot replace a built-in name.
+
 ## 2. The feature matrix
 
 The registered factory names and their confirmed features. "Native spin" means the
