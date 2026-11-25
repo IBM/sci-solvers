@@ -13,8 +13,11 @@ dependencies = [
     "pyyaml",
     "jsonargparse",
     "numba>=0.66.0",
-    # 2.15.1 has no macOS arm64 wheel and its source archive is missing a build file
-    # (pyscf/lib/libxcfun.patch), so it cannot be installed on Apple Silicon.
+    # 2.15.1 has no macOS arm64 wheel on PyPI and its source archive is missing a build file
+    # (pyscf/lib/libxcfun.patch), so it cannot be installed on Apple Silicon. Excluded for uv and
+    # pixi alike, so both lock the same version. Only PyPI has this problem: conda-forge builds
+    # 2.15.1 for osx-arm64, so a pixi project that takes pyscf from conda-forge is not affected
+    # (and must relax this exclusion, or its solve conflicts with it).
     "pyscf>=2.5,!=2.15.1",
     "psutil",
     "qiskit-addon-dice-solver",
