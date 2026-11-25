@@ -97,6 +97,7 @@ from torch_sci_solver.torch_impl.rdm import (
 from torch_sci_solver.torch_impl.sbdiag import _to_int64_python
 
 if TYPE_CHECKING:
+    from torch_sci_solver.torch_impl.hamiltonian_blocks import DiagonalBlocks
     from torch_sci_solver.torch_impl.integrals import TorchIntegrals
     from torch_sci_solver.torch_impl.probe_spinless import TorchSpinlessSCIState
 
@@ -595,6 +596,32 @@ _INIT_VECTOR_MIN_NORM = 1e-8
 # uncertain by more than the fp32 Ritz error (measured on H6 and N2 2.2 Å), so the
 # fp64 Rayleigh-quotient matvec is skipped; tighter, it is kept.
 _FP32_RITZ_MIN_TOL = 1e-3
+
+# ``seed_strategy`` values; "lowest_diagonal" is another name for "smallest_int".
+_SEED_STRATEGIES = ("smallest_int", "lowest_diagonal", "connected")
+
+# A single-root solve on a basis that splits into blocks no single or double
+# excitation connects solves at most this many blocks besides its start's (each
+# costs one Davidson solve), lowest diagonal entry first, and warns about the rest.
+_MAX_BLOCK_SOLVES = 8
+
+# The torch_sci_solver package directory: warnings point at the first frame outside it.
+_PACKAGE_DIR = str(pathlib.Path(__file__).parent.parent) + os.sep
+
+
+def _external_stacklevel() -> int:
+    """``warnings.warn`` stacklevel of the first caller outside this package.
+
+    Call it from the function that warns. The solve paths reach that function
+    through call chains of different depths, so a fixed stacklevel would point
+    at a different solver frame on each.
+    """
+    frame = inspect.currentframe()
+    level = 0
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
+        frame = frame.f_back
+        level += 1
+    return max(1, level)
 
 
 def _validate_init_vector(
@@ -2586,12 +2613,17 @@ class TorchSCISolver:
                               basis — i.e., which determinant Davidson seeds
                               its initial vector ``W = [1, 0, ..., 0]`` on.
                               One of:
-                                * ``'smallest_int'`` (default) — sort the
-                                  basis by integer value and seed from the
-                                  smallest. For closed-shell
-                                  chemistry this lands on the HF-like
-                                  determinant, which is in the singlet-
-                                  ground-state Krylov basin. Empirically
+                                * ``'smallest_int'`` (default; also spelled
+                                  ``'lowest_diagonal'``) — sort the basis by
+                                  integer value. A single-root solve seeds at
+                                  the lowest entry of the diagonal Davidson
+                                  sees (``argmin`` of diag H, spin penalty
+                                  included); a multi-root seed block starts
+                                  at the smallest-integer determinant and
+                                  adds the lowest-diagonal ones. For
+                                  closed-shell chemistry the lowest diagonal
+                                  is the HF-like determinant, which is in the
+                                  singlet-ground-state Krylov basin. Empirically
                                   gives clean singlets up through N_BITS=7000
                                   on a 36-orbital benchmark when combined with
                                   αβ-swap projection (auto-enabled for
@@ -2608,6 +2640,18 @@ class TorchSCISolver:
                                   intermediate basis. O(N²) bit-popcount,
                                   sub-second at N=14k; cost goes to
                                   ``stats['t_seed']``.
+                              Either way, when the basis splits into blocks
+                              of H that no single or double excitation
+                              connects, a single-root solve then solves each
+                              other block from its own lowest diagonal entry
+                              (at most 8 of them, with a warning for the
+                              rest) and returns the lowest energy, since
+                              Davidson does not leave its start's block. On
+                              one device a product-mode block is solved on
+                              its own strings, at the cost of its size.
+                              Each subspace entry of
+                              ``stats['per_call_log']`` records
+                              ``n_blocks`` and the ``block_solves``.
             apply_ab_projection:
                               When True (default), apply the αβ-swap projection
                               to Davidson on αβ-symmetric bases (auto-detected).
@@ -2926,9 +2970,9 @@ class TorchSCISolver:
             )
         if not 0.0 < float(budget_fraction) <= 1.0:
             raise ValueError(f"budget_fraction must be in (0, 1], got {budget_fraction!r}")
-        if seed_strategy not in ("smallest_int", "connected"):
+        if seed_strategy not in _SEED_STRATEGIES:
             raise ValueError(
-                f"seed_strategy must be 'smallest_int' or 'connected', got {seed_strategy!r}"
+                f"seed_strategy must be one of {_SEED_STRATEGIES}, got {seed_strategy!r}"
             )
         if unknown_call_kwargs not in UNKNOWN_CALL_KWARGS_POLICIES:
             raise ValueError(
@@ -4389,11 +4433,11 @@ class TorchSCISolver:
                     "from the operator's staged exchange. Pass "
                     "distributed={'tile': 'force'} or a (p_alpha, p_beta) grid."
                 )
-        if self.seed_strategy != "smallest_int":
+        if self.seed_strategy == "connected":
             raise ValueError(
                 f"seed_strategy={self.seed_strategy!r} needs the streamed "
                 "excitation tables; a structural pair basis supports only "
-                "seed_strategy='smallest_int'."
+                "seed_strategy='smallest_int' (or 'lowest_diagonal')."
             )
         if matvec != "local":
             raise ValueError(
@@ -5883,6 +5927,327 @@ class TorchSCISolver:
         else:
             energies_t = torch.atleast_1d(torch.as_tensor(energies, dtype=torch.float64)) + e_shift
         return energies_t, vecs, single, energy_mode
+
+    def _solve_other_blocks(
+        self,
+        result: Any,
+        perf: dict,
+        blocks: "Optional[DiagonalBlocks]",
+        run_cold: Callable[[int], Tuple[Any, dict]],
+        *,
+        warm: bool,
+    ) -> Tuple[Any, dict]:
+        """The lowest single-root solution over every block of ``H`` that can hold it.
+
+        Args:
+            result, perf: Davidson result and perf dict of the solve from the
+                caller's start vector.
+            blocks: Blocks of the operator with their lowest diagonal entries,
+                or ``None`` when it is one block (or was not split).
+            run_cold: Solves the block holding a global basis index, from that
+                index, and returns its ``(result, perf)`` with the eigenvector
+                over the whole basis; ``perf["solve_dimension"]`` names the
+                dimension of a smaller basis it ran on (a product block on one
+                device runs on its own strings; pair, spinless and distributed
+                bases run on the full space, which has no product form or no
+                one-rank layout for the block).
+            warm: Whether ``result`` started from a warm or caller-supplied
+                vector.
+
+        Returns:
+            The lowest solve's ``(result, perf)``. Its ``n_matvecs`` is summed
+            over every solve, and ``perf`` records ``n_blocks``, the
+            ``block_solves`` run (seed index, energy, matvecs, convergence,
+            block size and solve dimension) and whether the returned solve was
+            the ``warm`` one.
+
+        Notes
+        -----
+        Davidson does not leave the block of ``H`` its start vector lies in, and
+        the block holding the lowest diagonal entry need not hold the ground
+        state: a block whose lowest diagonal entry is higher has a lower
+        eigenvalue when its couplings are strong enough. So every block that
+        ``result`` does not lie in is solved once from its own lowest diagonal
+        entry, lowest first, and the lowest energy wins. A block of uncoupled
+        determinants has its diagonal entries as eigenvalues, so it is solved
+        only when its lowest entry lies below the best energy found. At most
+        ``_MAX_BLOCK_SOLVES`` other blocks are solved, with a ``RuntimeWarning``
+        that counts the rest. A multi-root solve is not split (its seed block
+        holds the lowest-diagonal unit vectors); without the missed-root check
+        a ``RuntimeWarning`` says that roots in other blocks can be missed.
+        """
+        perf["n_blocks"] = 1 if blocks is None else blocks.n_nonempty
+        if blocks is None:
+            return result, perf
+        n_blocks = blocks.n_nonempty
+        if self.n_roots > 1:
+            if not self._missed_root_check(warm).get("missed_root_check"):
+                warnings.warn(
+                    f"the CI space splits into {n_blocks} blocks that no single or double "
+                    "excitation connects; a multi-root Davidson solve only reaches the blocks "
+                    "its seed vectors lie in, so it can miss roots in the others. Pass "
+                    "davidson_missed_root_check=True to search for them, or remove the "
+                    "disconnected strings from the basis.",
+                    RuntimeWarning,
+                    stacklevel=_external_stacklevel(),
+                )
+            return result, perf
+
+        info = result[2]
+        full_dimension = int(blocks.sizes.sum())
+        n_matvecs = int(info.get("n_matvecs") or 0)
+        weights = blocks.weights(result[1])
+        start_block = int(torch.argmax(weights))
+        if float(weights[start_block]) <= 0.5 * float(weights.sum()):
+            start_block = -1  # the start's solve spans several blocks
+        # One record per solve: its seed index (None for the caller's start),
+        # energy, matvecs, convergence, the size of the block it lies in, and
+        # the dimension of the basis it ran on (smaller for a block's own basis).
+        solves = [
+            {
+                "seed": None,
+                "E": float(result[0]),
+                "n_matvecs": info.get("n_matvecs"),
+                "converged": bool(info.get("converged")),
+                "size": int(blocks.sizes[start_block]) if start_block >= 0 else None,
+                "dimension": full_dimension,
+            }
+        ]
+        order = torch.argsort(blocks.minima)[:n_blocks].tolist()
+        trivial_flags = blocks.trivial.tolist()
+        pending = [b for b in order if b != start_block and not trivial_flags[b]]
+        if len(pending) > _MAX_BLOCK_SOLVES:
+            warnings.warn(
+                f"the CI space splits into {n_blocks} blocks that no single or double "
+                f"excitation connects; {len(pending)} of them hold coupled determinants "
+                f"besides the start's. Only the {_MAX_BLOCK_SOLVES} with the lowest diagonal "
+                "entries are solved, so the ground state can lie in one of the other "
+                f"{len(pending) - _MAX_BLOCK_SOLVES}. Remove the disconnected strings from "
+                "the basis.",
+                RuntimeWarning,
+                stacklevel=_external_stacklevel(),
+            )
+            pending = pending[:_MAX_BLOCK_SOLVES]
+        best, best_perf, best_is_start = result, perf, True
+
+        def solve(block: int) -> None:
+            """Solve ``block`` from its lowest diagonal entry; keep it if lower."""
+            nonlocal best, best_perf, best_is_start, n_matvecs
+            seed = int(blocks.seeds[block])
+            candidate, candidate_perf = run_cold(seed)
+            candidate_info = candidate[2]
+            n_matvecs += int(candidate_info.get("n_matvecs") or 0)
+            solves.append({
+                "seed": seed,
+                "E": float(candidate[0]),
+                "n_matvecs": candidate_info.get("n_matvecs"),
+                "converged": bool(candidate_info.get("converged")),
+                "size": int(blocks.sizes[block]),
+                "dimension": int(candidate_perf.pop("solve_dimension", full_dimension)),
+            })
+            if float(candidate[0]) < float(best[0]):
+                best, best_perf, best_is_start = candidate, candidate_perf, False
+
+        for block in pending:
+            solve(block)
+        trivial = [b for b in order if b != start_block and trivial_flags[b]]
+        if trivial:
+            energy = float(best[0])
+            if float(blocks.minima[trivial[0]]) < energy - 1e-9 * max(1.0, abs(energy)):
+                solve(trivial[0])
+        best[2]["n_matvecs"] = n_matvecs
+        best_perf["warm"] = warm and best_is_start
+        best_perf["n_blocks"] = n_blocks
+        best_perf["block_solves"] = solves
+        return best, best_perf
+
+    def _lowest_diagonal_index(
+        self,
+        diagonal: torch.Tensor,
+        *,
+        layout: Any = None,
+        context: Any = None,
+        block_solve: bool = False,
+    ) -> Optional[int]:
+        """Global index of the lowest Davidson diagonal entry, for a single-root cold start.
+
+        Args:
+            diagonal: Diagonal of the operator Davidson sees (spin penalty
+                included), full or rank-local.
+            layout: Index layout of a rank-local ``diagonal`` (see
+                :func:`~torch_sci_solver.torch_impl.distributed_davidson.global_smallest_hii`).
+            context: Distributed context of a rank-local ``diagonal``.
+            block_solve: The solve of one block on its own strings, which
+                starts at that block's lowest diagonal entry whatever the
+                ``seed_strategy``, like the full-space block solves.
+
+        Returns:
+            The index, or ``None`` to keep the strategy's own seed:
+            ``seed_strategy="connected"`` keeps its most-connected determinant,
+            and a multi-root seed block already adds the lowest-diagonal unit
+            vectors after its smallest-integer first column.
+        """
+        if self.n_roots > 1 or (self.seed_strategy == "connected" and not block_solve):
+            return None
+        values = diagonal.real if diagonal.is_complex() else diagonal
+        if layout is None:
+            return int(torch.argmin(values))
+        from torch_sci_solver.torch_impl.distributed_davidson import global_smallest_hii
+
+        return int(global_smallest_hii(values, layout, k=1, group=context.group)[0][0])
+
+    def _product_blocks(
+        self,
+        adets_t: torch.Tensor,
+        bdets_t: torch.Tensor,
+        norb: int,
+        diagonal: torch.Tensor,
+        *,
+        index: Optional[torch.Tensor] = None,
+        context: Any = None,
+    ) -> "Optional[DiagonalBlocks]":
+        """The blocks ``C_α × C_β`` of a product basis, over the entries of ``diagonal``.
+
+        ``index`` holds the flat global indices of a rank-local ``diagonal`` and
+        ``context`` its ranks, which then share the string-distance work.
+        """
+        from torch_sci_solver.torch_impl import hamiltonian_blocks as hb
+
+        symmetric = adets_t.shape == bdets_t.shape and bool(torch.equal(adets_t, bdets_t))
+
+        def forest(strings: torch.Tensor) -> torch.Tensor:
+            """String forest, with its distance rows shared over the ranks."""
+            values = strings.cpu().numpy()
+            if context is None or context.world_size <= 1:
+                return hb.string_forest(values, norb)
+            m = int(values.shape[0])
+            rows = (
+                m * context.rank // context.world_size,
+                m * (context.rank + 1) // context.world_size,
+            )
+            return hb.merge_rank_forests(hb.string_forest(values, norb, rows=rows), context).cpu()
+
+        forest_a = forest(adets_t)
+        forest_b = forest_a if symmetric else forest(bdets_t)
+        if not bool(forest_a.any()) and not bool(forest_b.any()):
+            return None  # one string component per spin: one block, no per-entry work
+        labels, n_blocks, trivial = hb.product_block_labels(
+            forest_a, forest_b, symmetric=symmetric, index=index, device=diagonal.device
+        )
+        blocks = hb.diagonal_blocks(
+            diagonal, labels, n_blocks, trivial, index=index, context=context
+        )
+        if blocks is None:
+            return None
+        return dataclasses.replace(blocks, string_forests=(forest_a, forest_b))
+
+    def _pair_blocks(
+        self,
+        pair_basis: Any,
+        pair_helpers: Any,
+        norb: int,
+        diagonal: torch.Tensor,
+        *,
+        swap: Optional[torch.Tensor] = None,
+        index: Optional[torch.Tensor] = None,
+        context: Any = None,
+        positions: Optional[torch.Tensor] = None,
+        n_positions: int = 0,
+    ) -> "Optional[DiagonalBlocks]":
+        """The blocks of a GDB pair basis, over the entries of ``diagonal``.
+
+        An explicit pair list is split by union-find over its excitation
+        tables, with the bra range shared over the ranks, and ``swap`` (the
+        αβ-swap permutation of a projected solve) merges each block with its
+        mirror. A structural basis has no tables: its blocks are the products
+        of the per-spin string components, which can merge blocks that only its
+        pair structure separates. ``positions`` places the pair list in a
+        masked product layout of ``n_positions`` entries, whose inactive
+        entries form one more block. ``index`` and ``context`` are as in
+        :meth:`_product_blocks`.
+        """
+        from torch_sci_solver.torch_impl import hamiltonian_blocks as hb
+        from torch_sci_solver.torch_impl.pairs import StructuralPairBasis
+
+        if isinstance(pair_basis, StructuralPairBasis):
+            alphas, betas = pair_basis.unique_alphas, pair_basis.unique_betas
+            symmetric = alphas.shape == betas.shape and bool(torch.equal(alphas, betas))
+            forest_a = hb.string_forest(alphas.cpu().numpy(), norb)
+            forest_b = forest_a if symmetric else hb.string_forest(betas.cpu().numpy(), norb)
+            if not bool(forest_a.any()) and not bool(forest_b.any()):
+                return None
+            owned = (
+                torch.arange(pair_basis.n_pairs, dtype=torch.int64, device=pair_basis.device)
+                if index is None
+                else index
+            )
+            alpha_uid, beta_uid = pair_basis.pair_uids(owned)
+            labels, n_blocks, trivial = hb.product_block_labels(
+                forest_a,
+                forest_b,
+                symmetric=symmetric,
+                index=alpha_uid * pair_basis.n_unique_betas + beta_uid,
+                device=diagonal.device,
+            )
+            return hb.diagonal_blocks(
+                diagonal, labels, n_blocks, trivial, index=index, context=context
+            )
+        n = int(pair_basis.n_pairs)
+        share = None
+        if context is not None and context.world_size > 1:
+            share = (
+                n * context.rank // context.world_size,
+                n * (context.rank + 1) // context.world_size,
+            )
+        streams = (
+            pair_helpers.asingles,
+            pair_helpers.adoubles,
+            pair_helpers.bsingles,
+            pair_helpers.bdoubles,
+            pair_helpers.ab_doubles,
+        )
+        edges = ((table["k_bra"], table["k_ket"]) for stream in streams for table in stream(share))
+        forest = hb.merge_rank_forests(hb.edge_forest(n, edges, device=diagonal.device), context)
+        if not bool(forest.any()):
+            return None  # one component: the caller's pairs form one block
+        labels, n_blocks, trivial = hb.graph_block_labels(forest.to(diagonal.device), swap=swap)
+        if positions is not None:
+            placed = torch.full((n_positions,), n_blocks, dtype=torch.int64, device=labels.device)
+            placed[positions.to(labels.device)] = labels
+            labels = placed
+            trivial = torch.cat([trivial, torch.ones(1, dtype=torch.bool)])
+            n_blocks += 1
+        if index is not None:
+            labels = labels[index.to(labels.device)]
+        return hb.diagonal_blocks(diagonal, labels, n_blocks, trivial, index=index, context=context)
+
+    def _spinless_blocks(
+        self,
+        helpers: Any,
+        n_dets: int,
+        diagonal: torch.Tensor,
+        *,
+        index: Optional[torch.Tensor] = None,
+        context: Any = None,
+    ) -> "Optional[DiagonalBlocks]":
+        """The blocks of a spinless basis, over the entries of ``diagonal``.
+
+        Union-find over the flat single and double excitation tables; every
+        rank streams them whole, so the forest needs no merge. ``index`` and
+        ``context`` are as in :meth:`_product_blocks`.
+        """
+        from torch_sci_solver.torch_impl import hamiltonian_blocks as hb
+
+        edges = (
+            (table["k_bra"], table["k_ket"])
+            for stream in (helpers.singles, helpers.doubles)
+            for table in stream()
+        )
+        forest = hb.edge_forest(n_dets, edges, device=diagonal.device)
+        if not bool(forest.any()):
+            return None  # one component: one block
+        labels, n_blocks, trivial = hb.graph_block_labels(forest, index=index)
+        return hb.diagonal_blocks(diagonal, labels, n_blocks, trivial, index=index, context=context)
 
     def _run_davidson(
         self,
@@ -7751,8 +8116,15 @@ class TorchSCISolver:
         call_spin_lambda: float,
         device: "Optional[torch.device]" = None,
         init_vector: Any = None,
+        davidson_only: bool = False,
     ):
         """Solve a single subspace. Returns (SCIResult, Optional[State], perf_dict).
+
+        With ``davidson_only`` (product mode, one device) the solve stops after
+        Davidson and returns ``(davidson_result, perf, adets, bdets)``: the raw
+        result over the deduplicated strings ``adets × bdets`` (Python ints, in
+        basis order). The block solves of a disconnected basis use it to solve
+        one block on its own strings.
 
         Extracted in the v0.11.0 phase-2 refactor from the inline body of
         ``__call__``'s per-subspace loop. Identical behavior to the inline
@@ -8061,9 +8433,10 @@ class TorchSCISolver:
         # destroy the B₀-prefix invariant the eigvec embedding relies
         # on. The cached state's solver_knobs already encode the
         # self.seed_strategy used at cache time; _validate_fingerprints
-        # enforces consistency between cache and current call.
+        # enforces consistency between cache and current call. A block solve
+        # (``davidson_only``) starts at the block's lowest diagonal entry instead.
         best_seed_a = None
-        if self.seed_strategy == "connected" and not warm_start_active:
+        if self.seed_strategy == "connected" and not warm_start_active and not davidson_only:
             t0 = _time.perf_counter()
             if limb_strings:
                 # Reorder the limb matrices row-wise; the Hamming distance the
@@ -8097,10 +8470,9 @@ class TorchSCISolver:
             best_seed_a = int(adets[0])
             with self._stats_lock:
                 self.stats["t_seed"] += _time.perf_counter() - t0
-        elif self.seed_strategy != "smallest_int":
+        elif self.seed_strategy not in _SEED_STRATEGIES:
             raise ValueError(
-                f"self.seed_strategy must be 'connected' or 'smallest_int', "
-                f"got {self.seed_strategy!r}"
+                f"self.seed_strategy must be one of {_SEED_STRATEGIES}, got {self.seed_strategy!r}"
             )
 
         M_a = len(adets)
@@ -8206,6 +8578,7 @@ class TorchSCISolver:
         if local_tpb:
             from torch_sci_solver.torch_impl.davidson import SEED_NOISE_SCALE
             from torch_sci_solver.torch_impl.distributed_davidson import (
+                _TileIndexLayout,
                 hash_uniform,
                 partition_rows_weighted,
             )
@@ -8310,23 +8683,30 @@ class TorchSCISolver:
                     local_bounds.start, local_bounds.stop, dtype=torch.int64
                 )
 
-            def _cold_local() -> torch.Tensor:
-                """Cold start on this rank's block: HF unit entry plus hashed noise."""
+            # Cold-start seed: basis index 0 until the diagonal Davidson sees is
+            # known; a single-root solve then moves it to that diagonal's lowest
+            # entry (below, after the spin penalty).
+            seed_index = 0
+
+            def _cold_local(index: Optional[int] = None) -> torch.Tensor:
+                """Cold start on this rank's block: seed unit entry plus hashed noise."""
+                seed = seed_index if index is None else index
                 noise = hash_uniform(local_global_index.to(dev), salt=0).to(dtype=self.dtype)
                 w_cold = SEED_NOISE_SCALE * noise
                 if w_cold.shape[0] > 0:
                     if tiled:
                         hf_pos = int(
                             torch.searchsorted(
-                                local_global_index, torch.tensor(0, dtype=torch.int64)
+                                local_global_index, torch.tensor(seed, dtype=torch.int64)
                             ).item()
                         )
                         owns_hf = (
                             hf_pos < local_global_index.numel()
-                            and int(local_global_index[hf_pos]) == 0
+                            and int(local_global_index[hf_pos]) == seed
                         )
                     else:
-                        hf_pos, owns_hf = 0, bool(local_bounds.start == 0)
+                        hf_pos = seed - local_bounds.start
+                        owns_hf = 0 <= hf_pos < w_cold.shape[0]
                     if owns_hf:
                         w_cold[hf_pos] = 1.0
                 return w_cold / _global_norm_local(w_cold, dist_ctx)
@@ -8446,6 +8826,8 @@ class TorchSCISolver:
                 # The 1-D entry's mapped vector; per-root rows are mapped at resolve time.
                 W = _map_init(init_vector if init_vector.ndim == 1 else init_vector[0])
             else:
+                # Re-seeded below for a single-root solve, once the diagonal
+                # Davidson sees (spin penalty included) is known.
                 W = basis_init_vector_torch(M_a, M_b, init=0, device=dev, dtype=self.dtype)
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)
@@ -8717,12 +9099,40 @@ class TorchSCISolver:
                     f"equal={M_a == M_b and torch.equal(adets_t, bdets_t)})"
                 )
 
-        if not local_tpb:
-            warm = False
+        # A single-root cold start seeds at the lowest entry of the diagonal
+        # Davidson sees (spin penalty included), not at basis index 0 (the
+        # smallest-α × smallest-β pair, which need not share a block with the
+        # ground state). Every other block is solved after the first solve.
+        if local_tpb:
+            lowest = self._lowest_diagonal_index(
+                hii_for_davidson,
+                layout=_TileIndexLayout(local_bounds) if tiled else local_partition,
+                context=dist_ctx,
+            )
+            if lowest is not None:
+                seed_index = lowest
+                if not warm:
+                    W = _cold_local()
+        else:
+            seed_index = 0
+            lowest = self._lowest_diagonal_index(hii_for_davidson, block_solve=davidson_only)
+            if lowest is not None:
+                seed_index = lowest
+                if not warm_start_active and init_vector is None:
+                    W = basis_init_vector_torch(
+                        M_a, M_b, init=0, device=dev, dtype=self.dtype, seed_index=seed_index
+                    )
+            # A probe_state embed is a warm start (it arms the multi-root
+            # missed-root check), as on the GDB and owner-computes paths.
+            warm = warm_start_active
             if init_vector is not None:
-                _cold_tpb = lambda: basis_init_vector_torch(  # noqa: E731
-                    M_a, M_b, init=0, device=dev, dtype=self.dtype
-                )
+
+                def _cold_tpb() -> torch.Tensor:
+                    """Cold start at the seed determinant."""
+                    return basis_init_vector_torch(
+                        M_a, M_b, init=0, device=dev, dtype=self.dtype, seed_index=seed_index
+                    )
+
                 if init_vector.ndim == 1:
                     W, warm = _resolve_start_vector(W, project_fn, _cold_tpb, init_vector)
                 else:
@@ -8758,57 +9168,147 @@ class TorchSCISolver:
             get_integrals_fingerprint=get_integrals_fingerprint,
             solver_knob_snapshot=solver_knob_snapshot,
         )
-        t0 = _time.perf_counter()
-        if local_tpb:
-            _dav_result, perf_dav = self._run_davidson_distributed_local(
+
+        def _run(
+            start: torch.Tensor, start_warm: bool, start_checkpoint: Any = None
+        ) -> Tuple[Any, dict]:
+            """One Davidson solve of this subspace from ``start``."""
+            if local_tpb:
+                return self._run_davidson_distributed_local(
+                    hii_for_davidson,
+                    start,
+                    _local_op_for_dav,
+                    local_bounds,
+                    context=self._distributed_ctx,
+                    call_max_iter=call_max_iter,
+                    chosen_nb=chosen_nb,
+                    call_eps=call_eps,
+                    call_de_tol=call_de_tol,
+                    project_fn=project_fn,
+                    warm=start_warm,
+                    checkpoint=start_checkpoint,
+                )
+            if self._distributed_ctx is not None:
+                # Replicated fallback (small basis / post-processing without a tile
+                # grid): the ``C``/``HC`` blocks stay partitioned as
+                # ``DistributedVector``s while the operator applies on a gathered
+                # full vector. The narrow subspace and complex coefficients are
+                # both supported; only the missed-root search is not (it needs the
+                # owner-computes path and is rejected in ``_run_davidson_distributed``).
+                return self._run_davidson_distributed(
+                    hii_for_davidson,
+                    start,
+                    matvec,
+                    call_max_iter,
+                    chosen_nb,
+                    call_eps,
+                    call_de_tol=call_de_tol,
+                    project_fn=project_fn,
+                    context=self._distributed_ctx,
+                    warm=start_warm,
+                    checkpoint=start_checkpoint,
+                )
+            return self._run_davidson(
                 hii_for_davidson,
-                W,
-                _local_op_for_dav,
-                local_bounds,
-                context=self._distributed_ctx,
+                start,
+                matvec,
+                call_max_iter,
+                chosen_nb,
+                call_eps,
+                call_de_tol=call_de_tol,
+                project_fn=project_fn,
+                warm=start_warm,
+            )
+
+        def _run_cold(index: int) -> Tuple[Any, dict]:
+            """Solve the block holding basis index ``index`` (its lowest diagonal entry).
+
+            On one device the block ``C_p × C_q`` is solved on its own strings,
+            re-entering this method, and the eigenvector is padded back into this
+            basis, so the solve costs what the block's size does. A projected
+            solve of an off-diagonal block (``p != q``) pads the mirror block
+            ``C_q × C_p`` too, as the αβ swap fixes it: ``v[j, i] = τ[i, j] v[i, j]``
+            (the two blocks have one spectrum). A distributed solve starts at
+            ``index`` on the full space instead: the block's own basis would need
+            its own rank layout and a redistribution of the padded vector.
+            """
+            if local_tpb:
+                return _run(_cold_local(index), False)
+            if self._distributed_ctx is not None or blocks is None:
+                start = basis_init_vector_torch(
+                    M_a, M_b, init=0, device=dev, dtype=self.dtype, seed_index=index
+                )
+                return _run(start, False)
+            assert blocks.string_forests is not None
+            forest_a, forest_b = blocks.string_forests
+            row, col = divmod(index, M_b)
+            rows = torch.nonzero(forest_a == forest_a[row]).flatten().tolist()
+            cols = torch.nonzero(forest_b == forest_b[col]).flatten().tolist()
+            block_result = self._solve_one_subspace(
+                sub_idx=sub_idx,
+                strings_a=[adets[i] for i in rows],
+                strings_b=[bdets[j] for j in cols],
+                probe_state_this=None,
+                one_body_tensor=one_body_tensor,
+                two_body_tensor=two_body_tensor,
+                norb=norb,
+                nelec=nelec,
+                n_a=n_a,
+                n_b=n_b,
+                spin_sq=spin_sq,
+                spin_sq_target=spin_sq_target,
+                integrals=integrals,
+                get_integrals_fingerprint=get_integrals_fingerprint,
+                probe_method=None,
+                probe_kwargs_in={},
+                build_output_states=False,
+                solver_knob_snapshot=solver_knob_snapshot,
                 call_max_iter=call_max_iter,
-                chosen_nb=chosen_nb,
                 call_eps=call_eps,
                 call_de_tol=call_de_tol,
-                project_fn=project_fn,
-                warm=warm,
-                checkpoint=checkpoint,
+                call_spin_lambda=call_spin_lambda,
+                device=dev,
+                davidson_only=True,
             )
-        elif self._distributed_ctx is not None:
-            # Replicated fallback (small basis / post-processing without a tile
-            # grid): the ``C``/``HC`` blocks stay partitioned as
-            # ``DistributedVector``s while the operator applies on a gathered
-            # full vector. The narrow subspace and complex coefficients are
-            # both supported; only the missed-root search is not (it needs the
-            # owner-computes path and is rejected in ``_run_davidson_distributed``).
-            _dav_result, perf_dav = self._run_davidson_distributed(
-                hii_for_davidson,
-                W,
-                matvec,
-                call_max_iter,
-                chosen_nb,
-                call_eps,
-                call_de_tol=call_de_tol,
-                project_fn=project_fn,
-                context=self._distributed_ctx,
-                warm=warm,
-                checkpoint=checkpoint,
+            (energy, block_vec, block_info), block_perf, block_a, block_b = block_result
+            row_of = {string: i for i, string in enumerate(adets)}
+            col_of = {string: j for j, string in enumerate(bdets)}
+            r = torch.tensor([row_of[s] for s in block_a], dtype=torch.int64, device=dev)
+            c = torch.tensor([col_of[s] for s in block_b], dtype=torch.int64, device=dev)
+            block2d = block_vec.to(dev).reshape(len(block_a), len(block_b))
+            padded = torch.zeros((M_a, M_b), dtype=block2d.dtype, device=dev)
+            padded[r[:, None], c[None, :]] = block2d
+            if project_fn is not None and bool(forest_a[row] != forest_b[col]):
+                padded[c[:, None], r[None, :]] = (_tau[r[:, None], c[None, :]] * block2d).T
+                padded = padded * 2.0**-0.5
+            block_perf["solve_dimension"] = len(block_a) * len(block_b)
+            return (energy, padded.reshape(-1), block_info), block_perf
+
+        t0 = _time.perf_counter()
+        _dav_result, perf_dav = _run(W, warm, checkpoint)
+        # Blocks of H that no single or double excitation connects: Davidson does
+        # not leave its start's block, so each other block gets its own solve. A
+        # basis that fits in one block is diagonalized densely, whole.
+        blocks = None
+        if local_tpb:
+            blocks = self._product_blocks(
+                adets_t, bdets_t, norb, hii_for_davidson, index=local_global_index, context=dist_ctx
             )
-        else:
-            _dav_result, perf_dav = self._run_davidson(
-                hii_for_davidson,
-                W,
-                matvec,
-                call_max_iter,
-                chosen_nb,
-                call_eps,
-                call_de_tol=call_de_tol,
-                project_fn=project_fn,
-                warm=warm,
-            )
+        elif N > chosen_nb:
+            blocks = self._product_blocks(adets_t, bdets_t, norb, hii_for_davidson)
+        _dav_result, perf_dav = self._solve_other_blocks(
+            _dav_result, perf_dav, blocks, _run_cold, warm=warm
+        )
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)
         t_dav = _time.perf_counter() - t0
+        if davidson_only:
+            # A block solve of a larger basis: its caller times it and pads it.
+            if verbose_lines:
+                with self._print_lock:
+                    for _ln in verbose_lines:
+                        print(_ln)
+            return _dav_result, perf_dav, adets, bdets
         with self._stats_lock:
             self.stats["t_davidson"] += t_dav
 
@@ -9188,9 +9688,9 @@ class TorchSCISolver:
         verbose_lines: list[str] = []
 
         # --- pair-mode feature gates ---------------------------------------
-        if self.seed_strategy not in ("smallest_int", "connected"):
+        if self.seed_strategy not in _SEED_STRATEGIES:
             raise ValueError(
-                f"seed_strategy must be 'smallest_int' or 'connected', got {self.seed_strategy!r}"
+                f"seed_strategy must be one of {_SEED_STRATEGIES}, got {self.seed_strategy!r}"
             )
         # apply_ab_projection: honored when the pair set is closed under
         # (alpha, beta) -> (beta, alpha); skipped otherwise (see docstring).
@@ -9510,6 +10010,7 @@ class TorchSCISolver:
         # original basis is kept for the returned states, which are sliced back
         # to the caller's pairs.
         orig_pair_basis = pair_basis
+        orig_pair_helpers = pair_helpers
         orig_n_pairs = int(n_pairs)
         superset_positions = None
         superset_active = None
@@ -9721,7 +10222,12 @@ class TorchSCISolver:
         # (α, β) integer pair — the HF-like determinant for closed-shell
         # chemistry: index 0 on a single-word basis without bit 63, located by
         # ``_smallest_int_pair_index`` otherwise (limb strings, bit 63, or the
-        # per-block minima of a structural basis). The
+        # per-block minima of a structural basis). A single-root cold start
+        # moves it to the lowest entry of the diagonal Davidson sees, once the
+        # spin penalty and the superset mask are in (below): pairs drawn from
+        # string clusters more than a double excitation apart split H into
+        # blocks, and the smallest-int pair need not share one with the ground
+        # state. The
         # ``connected`` strategy seeds at the pair with the highest degree
         # in the pair-helper coupling tables (α-single/double, β-single/
         # double, αβ-double). Davidson is basis-ordering-invariant, so we
@@ -9762,12 +10268,12 @@ class TorchSCISolver:
                     pair_tile_init_vector_local,
                 )
 
-                def _cold_local() -> torch.Tensor:
+                def _cold_local(index: Optional[int] = None) -> torch.Tensor:
                     """Owned-tile cold start: global seed entry plus hashed noise."""
                     return pair_tile_init_vector_local(
                         pair_basis,
                         local_bounds,
-                        seed_index=best_pair_idx,
+                        seed_index=best_pair_idx if index is None else index,
                         device=dev,
                         dtype=self.dtype,
                         rank=dist_ctx.rank,
@@ -9781,12 +10287,12 @@ class TorchSCISolver:
                     pair_basis_init_vector_local,
                 )
 
-                def _cold_local() -> torch.Tensor:
+                def _cold_local(index: Optional[int] = None) -> torch.Tensor:
                     """Owned-block cold start: global seed entry plus hashed noise."""
                     return pair_basis_init_vector_local(
                         n_pairs,
                         local_bounds,
-                        seed_index=best_pair_idx,
+                        seed_index=best_pair_idx if index is None else index,
                         device=dev,
                         dtype=self.dtype,
                         rank=dist_ctx.rank,
@@ -10093,6 +10599,13 @@ class TorchSCISolver:
                 )
 
         if not local_gdb:
+            # A single-root cold start seeds at the lowest entry of the diagonal
+            # Davidson sees (spin penalty included).
+            lowest = self._lowest_diagonal_index(hii_for_davidson)
+            if lowest is not None:
+                best_pair_idx = lowest
+                if not warm_start_active and init_vector is None:
+                    W = self._cold_pair_init_vector(n_pairs, best_pair_idx, dev)
             # The cached-state embed above already set the start vector; a
             # caller-supplied init_vector may still fail to overlap and fall
             # back to the cold seed below.
@@ -10167,6 +10680,22 @@ class TorchSCISolver:
             _inactive_fill = 4.0 * float(_gdb_hii_for_dav.abs().max().item()) + 1.0
             _gdb_hii_for_dav = _gdb_hii_for_dav.clone()
             _gdb_hii_for_dav[~superset_local_active] = _inactive_fill
+        if local_gdb:
+            # A single-root cold start seeds at the global lowest entry of the
+            # diagonal Davidson sees: spin penalty included, inactive superset
+            # pairs filled above.
+            from torch_sci_solver.torch_impl.distributed_davidson import _index_layout
+
+            assert _gdb_hii_for_dav is not None and local_bounds is not None
+            lowest = self._lowest_diagonal_index(
+                _gdb_hii_for_dav,
+                layout=_index_layout(n_pairs, local_bounds, dist_ctx),
+                context=dist_ctx,
+            )
+            if lowest is not None:
+                best_pair_idx = lowest
+                if not warm:
+                    W = _cold_local()
 
         if structural_spec is not None:
             basis_arrays = (
@@ -10206,52 +10735,99 @@ class TorchSCISolver:
             get_integrals_fingerprint=get_integrals_fingerprint,
             solver_knob_snapshot=solver_knob_snapshot,
         )
+
+        def _run(
+            start: torch.Tensor, start_warm: bool, start_checkpoint: Any = None
+        ) -> Tuple[Any, dict]:
+            """One Davidson solve of this subspace from ``start``."""
+            if local_gdb:
+                assert hii_local is not None and local_bounds is not None and dist_ctx is not None
+                return self._run_davidson_distributed_local(
+                    _gdb_hii_for_dav,
+                    start,
+                    _gdb_op_for_dav,
+                    local_bounds,
+                    context=dist_ctx,
+                    call_max_iter=call_max_iter,
+                    chosen_nb=chosen_nb,
+                    call_eps=call_eps,
+                    call_de_tol=call_de_tol,
+                    project_fn=project_fn,
+                    warm=start_warm,
+                    checkpoint=start_checkpoint,
+                )
+            if self._distributed_ctx is not None:
+                # Replicated fallback (small basis / post-processing without a tile
+                # grid); see the TPB branch above for the complex/narrow-subspace
+                # support and the missed-root limitation.
+                return self._run_davidson_distributed(
+                    hii_for_davidson,
+                    start,
+                    matvec,
+                    call_max_iter,
+                    chosen_nb,
+                    call_eps,
+                    call_de_tol=call_de_tol,
+                    project_fn=project_fn,
+                    context=self._distributed_ctx,
+                    warm=start_warm,
+                    checkpoint=start_checkpoint,
+                )
+            return self._run_davidson(
+                hii_for_davidson,
+                start,
+                matvec,
+                call_max_iter,
+                chosen_nb,
+                call_eps,
+                call_de_tol=call_de_tol,
+                project_fn=project_fn,
+                warm=start_warm,
+            )
+
+        def _run_cold(index: int) -> Tuple[Any, dict]:
+            """One solve from the cold start at pair ``index`` (another block's seed).
+
+            It runs on the full pair space: a pair block is no product of string
+            sets, so it has no smaller basis to re-enter the solve with.
+            """
+            if local_gdb:
+                return _run(_cold_local(index), False)
+            return _run(self._cold_pair_init_vector(n_pairs, index, dev), False)
+
         t0 = _time.perf_counter()
-        if local_gdb:
-            assert hii_local is not None and local_bounds is not None and dist_ctx is not None
-            _dav_result, perf_dav = self._run_davidson_distributed_local(
-                _gdb_hii_for_dav,
-                W,
-                _gdb_op_for_dav,
-                local_bounds,
-                context=dist_ctx,
-                call_max_iter=call_max_iter,
-                chosen_nb=chosen_nb,
-                call_eps=call_eps,
-                call_de_tol=call_de_tol,
-                project_fn=project_fn,
-                warm=warm,
-                checkpoint=checkpoint,
+        _dav_result, perf_dav = _run(W, warm, checkpoint)
+        # Blocks of H that no single or double excitation connects: Davidson does
+        # not leave its start's block, so each other block gets its own solve. A
+        # basis that fits in one block is diagonalized densely, whole. The blocks
+        # of a masked superset come from the caller's pair list.
+        blocks = None
+        if local_gdb or n_pairs > chosen_nb:
+            swap = None
+            if project_fn is not None and superset_active is None and structural_spec is None:
+                swap = _pair_ab_swap_permutation(pair_basis, norb, dev, self.dtype)[0]
+            owned_pairs = None
+            if local_gdb:
+                assert local_bounds is not None
+                owned_pairs = (
+                    local_bounds.pair_index
+                    if tiled
+                    else torch.arange(row_start, row_stop, dtype=torch.int64)
+                )
+            blocks = self._pair_blocks(
+                orig_pair_basis,
+                orig_pair_helpers,
+                norb,
+                _gdb_hii_for_dav if local_gdb else hii_for_davidson,
+                swap=swap,
+                index=owned_pairs,
+                context=dist_ctx if local_gdb else None,
+                positions=superset_positions,
+                n_positions=n_pairs,
             )
-        elif self._distributed_ctx is not None:
-            # Replicated fallback (small basis / post-processing without a tile
-            # grid); see the TPB branch above for the complex/narrow-subspace
-            # support and the missed-root limitation.
-            _dav_result, perf_dav = self._run_davidson_distributed(
-                hii_for_davidson,
-                W,
-                matvec,
-                call_max_iter,
-                chosen_nb,
-                call_eps,
-                call_de_tol=call_de_tol,
-                project_fn=project_fn,
-                context=self._distributed_ctx,
-                warm=warm,
-                checkpoint=checkpoint,
-            )
-        else:
-            _dav_result, perf_dav = self._run_davidson(
-                hii_for_davidson,
-                W,
-                matvec,
-                call_max_iter,
-                chosen_nb,
-                call_eps,
-                call_de_tol=call_de_tol,
-                project_fn=project_fn,
-                warm=warm,
-            )
+        _dav_result, perf_dav = self._solve_other_blocks(
+            _dav_result, perf_dav, blocks, _run_cold, warm=warm
+        )
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)
         t_dav = _time.perf_counter() - t0
@@ -10881,16 +11457,46 @@ class TorchSCISolver:
                     triton_matvec=self.matvec_impl == "triton",
                 )
 
+            chosen_nb = self._pick_num_block(basis.dim, 1, device=dev, n_roots=self.n_roots)
+
+            def _run_cold(index: int) -> Tuple[Any, dict]:
+                """One solve from the cold start at determinant ``index`` (a block's seed).
+
+                It runs on the full basis: a spinless block is no product of
+                string sets, so it has no smaller basis to re-enter the solve with.
+                """
+                start = basis_init_vector_spinless_torch(
+                    basis.dim, init=0, seed_index=index, device=dev, dtype=self.dtype
+                )
+                return self._run_davidson(
+                    hii,
+                    start,
+                    matvec,
+                    call_max_iter,
+                    chosen_nb,
+                    call_eps,
+                    call_de_tol=call_de_tol,
+                    project_fn=None,
+                )
+
             _dav_result, _perf_dav = self._run_davidson(
                 hii,
                 W,
                 matvec,
                 call_max_iter,
-                self._pick_num_block(basis.dim, 1, device=dev, n_roots=self.n_roots),
+                chosen_nb,
                 call_eps,
                 call_de_tol=call_de_tol,
                 project_fn=None,
                 warm=warm,
+            )
+            # Each block of H that no single or double excitation connects to the
+            # start's gets its own solve (a basis within one block is dense).
+            blocks = None
+            if basis.dim > chosen_nb:
+                blocks = self._spinless_blocks(helpers, basis.dim, hii)
+            _dav_result, _perf_dav = self._solve_other_blocks(
+                _dav_result, _perf_dav, blocks, _run_cold, warm=warm
             )
 
             # Unpack Davidson result -- single-root returns (float, Tensor(N,),
@@ -11128,9 +11734,13 @@ class TorchSCISolver:
         # the flat block is its contiguous range, a tile its sorted subset.
         index_layout = _ScatteredIndexLayout(owned_index, n_dets, ctx.world_size, ctx.rank)
 
-        def _cold() -> torch.Tensor:
-            """Global-argmin(hii) seed plus partition-invariant hashed noise."""
-            seed_index = global_smallest_hii(hii_local, index_layout, k=1, group=ctx.group)[0][0]
+        def _cold(index: Optional[int] = None) -> torch.Tensor:
+            """Global-argmin(hii) (or ``index``) seed plus partition-invariant hashed noise."""
+            seed_index = (
+                global_smallest_hii(hii_local, index_layout, k=1, group=ctx.group)[0][0]
+                if index is None
+                else index
+            )
             w = torch.zeros(bounds.local_size, dtype=self.dtype, device=dev)
             probe = torch.tensor([seed_index], dtype=torch.int64, device=dev)
             position = int(torch.searchsorted(owned_index, probe)[0])
@@ -11207,18 +11817,36 @@ class TorchSCISolver:
             cap_to_n=False,
         )
         chosen_nb = min(max(chosen_nb, self.n_roots + 3), n_dets)
-        _dav_result, _perf_dav = self._run_davidson_distributed_local(
-            hii_local,
-            W,
-            operator,
-            bounds,
-            context=ctx,
-            call_max_iter=call_max_iter,
-            chosen_nb=chosen_nb,
-            call_eps=call_eps,
-            call_de_tol=call_de_tol,
-            project_fn=None,
-            warm=warm,
+
+        def _run(start: torch.Tensor, start_warm: bool) -> Tuple[Any, dict]:
+            """One Davidson solve of this subspace from ``start``."""
+            return self._run_davidson_distributed_local(
+                hii_local,
+                start,
+                operator,
+                bounds,
+                context=ctx,
+                call_max_iter=call_max_iter,
+                chosen_nb=chosen_nb,
+                call_eps=call_eps,
+                call_de_tol=call_de_tol,
+                project_fn=None,
+                warm=start_warm,
+            )
+
+        def _run_cold(index: int) -> Tuple[Any, dict]:
+            """One solve from the cold start at determinant ``index`` (a block's seed).
+
+            It runs on the full basis, like the replicated spinless block solves.
+            """
+            return _run(_cold(index), False)
+
+        _dav_result, _perf_dav = _run(W, warm)
+        # Each block of H that no single or double excitation connects to the
+        # start's gets its own solve.
+        blocks = self._spinless_blocks(helpers, n_dets, hii_local, index=owned_index, context=ctx)
+        _dav_result, _perf_dav = self._solve_other_blocks(
+            _dav_result, _perf_dav, blocks, _run_cold, warm=warm
         )
         if self.n_roots == 1:
             energy_raw, eigvecs_raw, info = _dav_result
