@@ -6,6 +6,8 @@ from a string-valued config.
 name *without constructing* the solver.
 Add a solver by
 adding one ``_SOLVER_LOADERS`` entry (and the matching ``SolverType`` literal).
+Another installed package can add one without editing this file, by declaring an entry point
+in the ``sci_solvers.solvers`` group (see :data:`SOLVER_ENTRY_POINT_GROUP`).
 """
 
 __copyright__ = """
@@ -16,6 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 
 
 import importlib
+from importlib.metadata import entry_points
 from typing import Any, Callable, Literal
 
 from sci_solvers.energy_calculation_base import (
@@ -60,6 +63,29 @@ _SOLVER_LOADERS: dict[str, Callable[[], type]] = {
     "evsl": _loader(_GA, "EvslSolver"),
     "pyscf_davidson": _loader(_GA, "PyscfDavidsonSolver"),
 }
+
+#: Entry-point group in which other installed packages register solvers. An entry's name is the
+#: solver name and its value is ``"package.module:ClassName"``, for example in ``pyproject.toml``::
+#:
+#:     [project.entry-points."sci_solvers.solvers"]
+#:     my_solver = "my_package.my_solver:MySolver"
+SOLVER_ENTRY_POINT_GROUP = "sci_solvers.solvers"
+
+
+def _register_plugin_solvers() -> None:
+    """Add the solvers that installed packages advertise in :data:`SOLVER_ENTRY_POINT_GROUP`.
+
+    Like the built-in entries, a plugin's class is imported only when it is used, so a plugin
+    that fails to import does not break the factory. A plugin never replaces a built-in name, and
+    names are matched case-insensitively.
+    """
+    for entry_point in entry_points(group=SOLVER_ENTRY_POINT_GROUP):
+        name = entry_point.name.lower()
+        if name not in _SOLVER_LOADERS:
+            _SOLVER_LOADERS[name] = entry_point.load
+
+
+_register_plugin_solvers()
 
 # Public: the names ``create_solver`` understands, derived from the registry (sorted
 # for deterministic ordering). Useful for sweep launchers enumerating ``--solver``.

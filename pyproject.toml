@@ -13,7 +13,9 @@ dependencies = [
     "pyyaml",
     "jsonargparse",
     "numba>=0.66.0",
-    "pyscf>=2.5",
+    # 2.15.1 has no macOS arm64 wheel and its source archive is missing a build file
+    # (pyscf/lib/libxcfun.patch), so it cannot be installed on Apple Silicon.
+    "pyscf>=2.5,!=2.15.1",
     "psutil",
     "qiskit-addon-dice-solver",
     "qiskit-addon-sqd>=0.10",
